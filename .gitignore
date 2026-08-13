@@ -1,0 +1,11 @@
+.DS_Store
+.env
+.direnv
+/dist/
+/build/
+/ec2instances
+/output/
+/www/
+/.trae/
+/.vscode/
+/.bits-code-guard/

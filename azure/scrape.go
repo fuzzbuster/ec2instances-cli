@@ -1,0 +1,502 @@
+package azure
+
+import (
+	"encoding/json"
+	"fmt"
+	"github.com/fuzzbuster/ec2instances-cli/utils"
+	"log"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+)
+
+type AzureItem struct {
+	Slug        string `json:"slug"`
+	DisplayName string `json:"displayName"`
+}
+
+type AzureRootData struct {
+	Regions          []AzureItem `json:"regions"`
+	OperatingSystems []AzureItem `json:"operatingSystems"`
+}
+
+const AZURE_OS_URL = "https://azure.microsoft.com/api/v3/pricing/virtual-machines/page/details/{}/?showLowPriorityOffers=true"
+
+// AzureInstance is the instance data for a specific instance type in a specific region.
+type AzureInstance struct {
+	// This is all got from the specifications and pricing API's.
+	PrettyName   string                               `json:"pretty_name"`
+	Family       string                               `json:"family"`
+	Category     string                               `json:"category"`
+	Vcpu         float64                              `json:"vcpu"`
+	Memory       float64                              `json:"memory"`
+	Size         float64                              `json:"size"`
+	GPU          any                                  `json:"GPU"`
+	Pricing      map[string]map[string]map[string]any `json:"pricing"`
+	Regions      map[string]string                    `json:"regions"`
+	Availability utils.Availability                   `json:"availability,omitempty"`
+
+	// Everything from the compute API.
+	AvailabilityZones map[string]any `json:"availability_zones"`
+	PrettyNameAzure   string         `json:"pretty_name_azure,omitempty"`
+	AzureSpecsData    `json:",inline"`
+
+	disownedFromFamily bool
+}
+
+func enrichAzureInstance(instance *AzureInstance, instanceAttrs map[string]any, specsApiResponse *utils.SlowBuildingMap[string, *AzureSpecsApiIteratorItem], type_ string) error {
+	// Get the initial information from the fast loading json.
+	instance.PrettyName = instanceAttrs["instanceName"].(string)
+	instance.Family = instanceAttrs["series"].(string)
+	instance.Category = instanceAttrs["category"].(string)
+	instance.Vcpu = instanceAttrs["cores"].(float64)
+	instance.Memory = instanceAttrs["ram"].(float64)
+	vf, ok := instanceAttrs["diskSize"].(float64)
+	if ok {
+		instance.Size = vf
+	}
+	vs, ok := instanceAttrs["gpu"]
+	if ok {
+		instance.GPU = vs
+	}
+
+	// Get the instance type from the specs api.
+	specs, ok, err := specsApiResponse.Get(strings.ReplaceAll(strings.ToLower(type_+instance.InstanceType), "_", ""))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if instance.PrettyNameAzure == "" {
+		instance.PrettyNameAzure = strings.ReplaceAll(specs.Name, "_", " ")
+	} else if !instance.disownedFromFamily {
+		instance.disownedFromFamily = true
+		spaceSplit := strings.Split(instance.PrettyNameAzure, " ")
+		instance.PrettyNameAzure = strings.Join(spaceSplit[1:], " ")
+	}
+
+	// Parse the specs.
+	parseSpecs(&instance.AzureSpecsData, specs.Capabilities)
+	return nil
+}
+
+func processSpecsDataResult(instances map[string]*AzureInstance, instanceAttrs map[string]map[string]any, specsApiResponse *utils.SlowBuildingMap[string, *AzureSpecsApiIteratorItem]) error {
+	keysSorted := make([]string, 0, len(instanceAttrs))
+	for k := range instanceAttrs {
+		keysSorted = append(keysSorted, k)
+	}
+	sort.Strings(keysSorted)
+
+	for _, k := range keysSorted {
+		v := instanceAttrs[k]
+		instanceType, tier, ok := splitAzureOfferKey(k)
+		if !ok {
+			continue
+		}
+		instance, ok := instances[instanceType]
+		if !ok {
+			instance = &AzureInstance{
+				GPU:               "0",
+				Regions:           make(map[string]string),
+				AvailabilityZones: make(map[string]any),
+				Pricing:           make(map[string]map[string]map[string]any),
+				AzureSpecsData: AzureSpecsData{
+					InstanceType: instanceType,
+					Arch:         []string{},
+				},
+			}
+			instances[instanceType] = instance
+		}
+		if err := enrichAzureInstance(instance, v, specsApiResponse, tier); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func processAzureOsResponse(osSlug string, instances map[string]*AzureInstance, instancesMu *sync.Mutex, specsApiResponse *utils.SlowBuildingMap[string, *AzureSpecsApiIteratorItem]) error {
+	url := strings.Replace(AZURE_OS_URL, "{}", osSlug, 1)
+
+	var rm json.RawMessage
+	if err := utils.LoadJson(url, &rm); err != nil {
+		return err
+	}
+
+	var a map[string]map[string]map[string]any
+	if err := json.Unmarshal(rm, &a); err != nil {
+		return err
+	}
+
+	b, err := json.MarshalIndent(a, "", "    ")
+	if err != nil {
+		return err
+	}
+
+	m, ok := a["attributesByOffer"]
+	if !ok {
+		return fmt.Errorf("attributesByOffer not found")
+	}
+
+	log.Default().Println("Saving Azure OS response for", osSlug)
+	if err := utils.WriteAndCompressFile("azure/"+osSlug+".json", b); err != nil {
+		return err
+	}
+
+	instancesMu.Lock()
+	err = processSpecsDataResult(instances, m, specsApiResponse)
+	instancesMu.Unlock()
+	return err
+}
+
+var COPY_KEYS = map[string]map[string]string{
+	"basic": {
+		"perhour":     "basic",      // 0.032,
+		"perhourspot": "basic-spot", // 0.007731,
+		// "perhourhybridbenefit": 0.023,
+		// "perhourpaygoneyearsubscription": 0.05405,
+		// "perhourpaygthreeyearsubscription": 0.0437,
+		// "perhourspothybridbenefit": 0.003705
+	},
+	"lowpriority": {
+		"perhour": "lowpriority", // 1.044,
+		//"perhourhybridbenefit": 0.375,
+		// "perhourpaygoneyearsubscription": 0.4371,
+		// "perhourpaygthreeyearsubscription": 0.4164
+	},
+	"standard": {
+		"perhour":                               "ondemand",                      // 2.61,
+		"perhouroneyearreserved":                "yrTerm1Standard.allUpfront",    // 1.84159
+		"perhourthreeyearreserved":              "yrTerm3Standard.allUpfront",    // 1.44806,
+		"perunitoneyearsavings":                 "yrTerm1Savings.allUpfront",     // 2.00432,
+		"perunitthreeyearsavings":               "yrTerm3Savings.allUpfront",     // 1.62371,
+		"perhourspot":                           "spot_min",                      // 0.427518,
+		"perhourhybridbenefit":                  "hybridbenefit",                 // 1.874,
+		"perhouroneyearreservedhybridbenefit":   "yrTerm1Standard.hybridbenefit", // 1.10559,
+		"perhourthreeyearreservedhybridbenefit": "yrTerm3Standard.hybridbenefit", // 0.71206,
+		"perunitoneyearsavingshybridbenefit":    "yrTerm3Savings.hybridbenefit",  // 1.26832,
+		"perunitthreeyearsavingshybridbenefit":  "yrTerm3Savings.hybridbenefit",  // 0.88771,
+		"perhourpaygoneyearsubscription":        "yrTerm1Standard.subscription",  // 1.9361,
+		"perhourpaygthreeyearsubscription":      "yrTerm3Standard.subscription",  // 1.9154,
+		// "perhouroneyearreservedoneyearsubscription": 1.11241,
+		//"perhouroneyearreservedthreeyearsubscription": 1.09171,
+		// "perhourthreeyearreservedoneyearsubscription": 0.73856,
+		// "perhourthreeyearreservedthreeyearsubscription": 0.71786,
+		//"perhourspothybridbenefit": 0.306961
+	},
+}
+
+func processPricingDataResult(
+	instancesPricing map[string]map[string]map[string]map[string]any,
+	region string,
+	osSlug string,
+	pricingResponse map[string]map[string]any,
+) {
+	for k, respVal := range pricingResponse {
+		instanceType, _, ok := splitAzureOfferKey(k)
+		if !ok {
+			continue
+		}
+
+		instance, ok := instancesPricing[instanceType]
+		if !ok {
+			instance = make(map[string]map[string]map[string]any)
+			instancesPricing[instanceType] = instance
+		}
+		regionData, ok := instance[region]
+		if !ok {
+			regionData = make(map[string]map[string]any)
+			instance[region] = regionData
+		}
+		os, ok := regionData[osSlug]
+		if !ok {
+			os = make(map[string]any)
+			regionData[osSlug] = os
+		}
+
+		if respVal == nil {
+			continue
+		}
+
+		switch {
+		case strings.Contains(k, "basic"):
+			basic := COPY_KEYS["basic"]
+			for k2, v := range basic {
+				x, ok := respVal[k2]
+				if ok {
+					os[v] = x
+				}
+			}
+		case strings.Contains(k, "lowpriority"):
+			lowpriority := COPY_KEYS["lowpriority"]
+			for k2, v := range lowpriority {
+				x, ok := respVal[k2]
+				if ok {
+					os[v] = x
+				}
+			}
+		case strings.Contains(k, "standard"):
+			standard := COPY_KEYS["standard"]
+			for k2, v := range standard {
+				if strings.Contains(v, "yrTerm") {
+					reserved, ok := os["reserved"].(map[string]any)
+					if !ok {
+						reserved = make(map[string]any)
+						os["reserved"] = reserved
+					}
+					x, ok := respVal[k2]
+					if ok {
+						reserved[v] = x
+					}
+					if len(reserved) == 0 {
+						delete(os, "reserved")
+					}
+				} else {
+					x, ok := respVal[k2]
+					if ok {
+						os[v] = x
+					}
+				}
+			}
+		}
+
+		if len(os) == 0 {
+			delete(regionData, osSlug)
+			if len(regionData) == 0 {
+				delete(instance, region)
+				if len(instance) == 0 {
+					delete(instancesPricing, instanceType)
+				}
+			}
+		}
+	}
+}
+
+func splitAzureOfferKey(key string) (string, string, bool) {
+	firstDash := strings.IndexByte(key, '-')
+	lastDash := strings.LastIndexByte(key, '-')
+	if firstDash < 0 || lastDash <= firstDash+1 || lastDash == len(key)-1 {
+		return "", "", false
+	}
+	return key[firstDash+1 : lastDash], key[lastDash+1:], true
+}
+
+const AZURE_PLATFORM_AND_OS_URL = "https://azure.microsoft.com/api/v3/pricing/virtual-machines/page/{}/?showLowPriorityOffers=true"
+
+func processPricingDataForRegionAndOs(
+	region string,
+	osSlug string,
+	instancesPricing map[string]map[string]map[string]map[string]any,
+	instancesPricingMu *sync.Mutex,
+) error {
+	var a map[string]map[string]any
+	url := strings.Replace(AZURE_PLATFORM_AND_OS_URL, "{}", osSlug+"/"+region, 1)
+	if err := utils.LoadJson(url, &a); err != nil {
+		return err
+	}
+
+	b, err := json.MarshalIndent(a, "", "    ")
+	if err != nil {
+		return err
+	}
+
+	log.Default().Println("Saving Azure OS response for", region, osSlug)
+	if err := utils.WriteAndCompressFile("azure/"+region+"_"+osSlug+".json", b); err != nil {
+		return err
+	}
+
+	instancesPricingMu.Lock()
+	processPricingDataResult(instancesPricing, region, osSlug, a)
+	instancesPricingMu.Unlock()
+	return nil
+}
+
+func processAzureApi(regionsAndOsData *AzureRootData, specsApiResponse *utils.SlowBuildingMap[string, *AzureSpecsApiIteratorItem]) (map[string]*AzureInstance, error) {
+	instancesPricing := make(map[string]map[string]map[string]map[string]any)
+	instancesPricingMu := sync.Mutex{}
+
+	instances := make(map[string]*AzureInstance)
+	instancesMu := sync.Mutex{}
+
+	var fg utils.FunctionGroup
+
+	for _, os := range regionsAndOsData.OperatingSystems {
+		fg.Add(func() error {
+			return processAzureOsResponse(os.Slug, instances, &instancesMu, specsApiResponse)
+		})
+		for _, region := range regionsAndOsData.Regions {
+			fg.Add(func() error {
+				return processPricingDataForRegionAndOs(region.Slug, os.Slug, instancesPricing, &instancesPricingMu)
+			})
+		}
+	}
+
+	if err := fg.Run(); err != nil {
+		return nil, err
+	}
+
+	regionMap := make(map[string]string)
+	for _, region := range regionsAndOsData.Regions {
+		regionMap[region.Slug] = region.DisplayName
+	}
+
+	for instanceType, pricing := range instancesPricing {
+		instance, ok := instances[instanceType]
+		if !ok {
+			continue
+		}
+		instance.Pricing = pricing
+		instance.Availability = availabilityFromAzurePricing(pricing)
+		regions := make(map[string]string)
+		for region := range pricing {
+			regions[region] = regionMap[region]
+		}
+		instance.Regions = regions
+	}
+
+	return instances, nil
+}
+
+func availabilityFromAzurePricing(pricing map[string]map[string]map[string]any) utils.Availability {
+	availability := utils.Availability{}
+	for region, operatingSystems := range pricing {
+		options := map[string]utils.AvailabilityStatus{}
+		for _, prices := range operatingSystems {
+			for priceType, value := range prices {
+				switch priceType {
+				case "ondemand", "basic":
+					options["ondemand"] = utils.AvailabilityOffered
+				case "spot_min", "basic-spot":
+					options["spot"] = utils.AvailabilityOffered
+				case "lowpriority":
+					options["lowpriority"] = utils.AvailabilityOffered
+				case "reserved":
+					if reserved, ok := value.(map[string]any); ok && len(reserved) > 0 {
+						options["reserved"] = utils.AvailabilityOffered
+					}
+				}
+			}
+		}
+		if len(options) > 0 {
+			availability[region] = utils.RegionAvailability{
+				Status:          utils.AvailabilityOffered,
+				Evidence:        utils.AvailabilityPricing,
+				PurchaseOptions: options,
+			}
+		}
+	}
+	return availability
+}
+
+type AzureSpecsApiIteratorItemCapability struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type AzureSpecsApiIteratorItem struct {
+	ResourceType string                                `json:"resourceType"`
+	Capabilities []AzureSpecsApiIteratorItemCapability `json:"capabilities"`
+	Name         string                                `json:"name"`
+	Tier         string                                `json:"tier"`
+	Size         string                                `json:"size"`
+	Family       string                                `json:"family"`
+}
+
+type AzureSpecsApiIteratorResult struct {
+	Value    []*AzureSpecsApiIteratorItem `json:"value"`
+	NextLink *string                      `json:"nextLink"`
+}
+
+func getAzureSpecsApiIterator() *utils.SlowBuildingMap[string, *AzureSpecsApiIteratorItem] {
+	return utils.NewSlowBuildingMap(func(pushChunk func(map[string]*AzureSpecsApiIteratorItem)) error {
+		if !hasAzureCredentials() {
+			return nil
+		}
+
+		// Get everything we need to start the request.
+		accessToken, err := getAzureAccessToken()
+		if err != nil {
+			return err
+		}
+		subId := os.Getenv("AZURE_SUBSCRIPTION_ID")
+
+		// Handle getting the raw skus.
+		rawSkus := []*AzureSpecsApiIteratorItem{}
+		apiUrl := "https://management.azure.com/subscriptions/" + subId + "/providers/Microsoft.Compute/skus?api-version=2021-07-01"
+		for apiUrl != "" {
+			// Firstly, cast into a raw message. We need to process this twice.
+			var rm json.RawMessage
+			if err := utils.LoadJsonWithBearerToken(apiUrl, &rm, &accessToken); err != nil {
+				return err
+			}
+
+			// Process it into the iterator result.
+			var a AzureSpecsApiIteratorResult
+			if err := json.Unmarshal(rm, &a); err != nil {
+				return err
+			}
+			rawSkus = append(rawSkus, a.Value...)
+
+			// Remap it by the size.
+			remapped := make(map[string]*AzureSpecsApiIteratorItem)
+			for _, item := range a.Value {
+				remapped[strings.ReplaceAll(strings.ToLower(item.Name), "_", "")] = item
+			}
+			pushChunk(remapped)
+
+			// Get the next link.
+			if a.NextLink == nil {
+				apiUrl = ""
+			} else {
+				apiUrl = *a.NextLink
+			}
+		}
+
+		// Write the skus to a file.
+		return processRawSkuSpecs(rawSkus)
+	})
+}
+
+func hasAzureCredentials() bool {
+	return os.Getenv("AZURE_TENANT_ID") != "" &&
+		os.Getenv("AZURE_CLIENT_ID") != "" &&
+		os.Getenv("AZURE_CLIENT_SECRET") != "" &&
+		os.Getenv("AZURE_SUBSCRIPTION_ID") != ""
+}
+
+// DoAzureScraping is the main function that scrapes the Azure pricing data and saves it to a file.
+func DoAzureScraping() error {
+	specsApiResponse := getAzureSpecsApiIterator()
+
+	var regionsAndOsData AzureRootData
+	if err := utils.LoadJson("https://azure.microsoft.com/api/v4/pricing/virtual-machines/metadata/", &regionsAndOsData); err != nil {
+		return fmt.Errorf("load Azure metadata: %w", err)
+	}
+
+	// Process the instances and pricing data
+	instances, err := processAzureApi(&regionsAndOsData, specsApiResponse)
+	if err != nil {
+		return fmt.Errorf("process Azure data: %w", err)
+	}
+
+	// Warn about any instances that have specs missing.
+	for _, instance := range instances {
+		if instance.PrettyNameAzure == "" {
+			instance.PrettyNameAzure = instance.PrettyName
+		}
+	}
+
+	// Save the instances
+	instancesSorted := make([]*AzureInstance, 0, len(instances))
+	for _, instance := range instances {
+		instancesSorted = append(instancesSorted, instance)
+	}
+	sort.Slice(instancesSorted, func(i, j int) bool {
+		return instancesSorted[i].InstanceType < instancesSorted[j].InstanceType
+	})
+	if err := utils.SaveInstances(instancesSorted, "azure/instances.json"); err != nil {
+		return fmt.Errorf("save Azure instances: %w", err)
+	}
+	return nil
+}
