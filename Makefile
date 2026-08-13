@@ -28,7 +28,7 @@ release-archives:
 	test -n "$$GITHUB_REF_NAME"
 	test -n "$$GITHUB_SHA"
 	bash -eu -o pipefail -c '\
-		version="$${GITHUB_REF_NAME#scraper-v}"; \
+		version="$${GITHUB_REF_NAME#v}"; \
 		build_date="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
 		mkdir -p dist; \
 		for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do \

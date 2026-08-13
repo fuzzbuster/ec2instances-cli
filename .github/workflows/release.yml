@@ -3,7 +3,7 @@ name: Release
 on:
     push:
         tags:
-            - "scraper-v*"
+            - "v*"
 
 permissions:
     contents: write
@@ -20,7 +20,7 @@ jobs:
             - name: Validate tag
               shell: bash
               run: |
-                  if [[ ! "$GITHUB_REF_NAME" =~ ^scraper-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+                  if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
                       echo "Invalid release tag: $GITHUB_REF_NAME" >&2
                       exit 1
                   fi
@@ -30,7 +30,7 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  version="${GITHUB_REF_NAME#scraper-v}"
+                  version="${GITHUB_REF_NAME#v}"
                   gh release create "$GITHUB_REF_NAME" \
                       dist/*.tar.gz dist/checksums.txt \
                       --title "ec2instances $version" \

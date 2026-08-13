@@ -20,7 +20,7 @@ build from source with Go 1.26:
 make build-local
 ```
 
-Release tags use the `scraper-v<semver>` format. Published targets are:
+Release tags use the `v<semver>` format. Published targets are:
 
 - Linux amd64 and arm64
 - macOS amd64 and arm64
